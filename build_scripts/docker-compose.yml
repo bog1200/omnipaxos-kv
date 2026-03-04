@@ -18,6 +18,9 @@ services:
     container_name: s1
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_API_PORT: 9000   # HTTP shim API port inside the container
+    ports:
+      - "9001:9000"              # host:9001 → container s1:9000
     volumes:
       - ./server-1-config.toml:/app/server-config.toml
       - ./cluster-config.toml:/app/cluster-config.toml
@@ -27,6 +30,9 @@ services:
     container_name: s2
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_API_PORT: 9000
+    ports:
+      - "9002:9000"              # host:9002 → container s2:9000
     volumes:
       - ./server-2-config.toml:/app/server-config.toml
       - ./cluster-config.toml:/app/cluster-config.toml
@@ -36,6 +42,9 @@ services:
     container_name: s3
     environment:
       <<: *common-server-variables
+      OMNIPAXOS_API_PORT: 9000
+    ports:
+      - "9003:9000"              # host:9003 → container s3:9000
     volumes:
       - ./server-3-config.toml:/app/server-config.toml
       - ./cluster-config.toml:/app/cluster-config.toml

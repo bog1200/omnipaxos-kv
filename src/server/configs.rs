@@ -22,6 +22,8 @@ pub struct LocalConfig {
     pub server_id: NodeId,
     pub listen_address: String,
     pub listen_port: u16,
+    /// Port for the Jepsen-compatible HTTP API (default: listen_port + 1000)
+    pub api_port: Option<u16>,
     pub num_clients: usize,
     pub output_filepath: String,
 }

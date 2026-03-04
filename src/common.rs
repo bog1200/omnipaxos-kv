@@ -7,6 +7,17 @@ pub mod messages {
         utils::Timestamp,
     };
 
+    /// The value returned to a caller for read-like operations.
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    pub enum KVResult {
+        /// Successful read – value (None means key not found)
+        Value(Option<String>),
+        /// CAS succeeded
+        CasOk,
+        /// CAS failed: current value did not match expected
+        CasFailed(Option<String>),
+    }
+
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum RegistrationMessage {
         NodeRegister(NodeId),
@@ -27,7 +38,7 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
         Write(CommandId),
-        Read(CommandId, Option<String>),
+        Read(CommandId, KVResult),
         StartSignal(Timestamp),
     }
 
@@ -65,6 +76,9 @@ pub mod kv {
         Put(String, String),
         Delete(String),
         Get(String),
+        /// Compare-and-swap: (key, expected_value, new_value)
+        /// expected_value = None means "key must not exist"
+        Cas(String, Option<String>, String),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +103,12 @@ pub mod kv {
                         }
                     }
                     KVCommand::Get(_) => (),
+                    KVCommand::Cas(key, expected, new_value) => {
+                        let current = snapshotted.get(key).cloned();
+                        if &current == expected {
+                            snapshotted.insert(key.clone(), new_value.clone());
+                        }
+                    }
                 }
             }
             // remove keys that were put back
