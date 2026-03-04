@@ -1,0 +1,17 @@
+### GET request to example server
+GET http://127.0.0.1:9001/kv/key1
+
+###
+GET http://127.0.0.1:9002/kv/key1
+
+
+###
+GET http://127.0.0.1:9003/kv/key1
+
+
+###
+PUT http://127.0.0.1:9002/kv/key1
+
+value1
+
+###

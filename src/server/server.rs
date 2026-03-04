@@ -8,56 +8,30 @@ use omnipaxos::{
 };
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
-use std::{collections::HashMap, fs::File, io::Write, time::Duration};
-use tokio::sync::oneshot;
+use std::{fs::File, io::Write, time::Duration};
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A command submitted via the HTTP API shim.
-pub struct ApiRequest {
-    pub command_id: CommandId,
-    pub kv_cmd: KVCommand,
-    /// Sender to resolve the HTTP response once the command is decided.
-    pub respond_to: oneshot::Sender<ApiResponse>,
-}
-
-/// The resolved response for an HTTP API request.
-#[derive(Debug)]
-pub enum ApiResponse {
-    Ok(KVResult),
-    /// The node is not the leader; client should redirect.
-    NotLeader(Option<NodeId>),
-}
-
 pub struct OmniPaxosServer {
     id: NodeId,
     database: Database,
-    network: Network,
+    pub network: Network,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
     peers: Vec<NodeId>,
-    /// Pending HTTP requests waiting for their command to be decided.
-    pending: HashMap<CommandId, oneshot::Sender<ApiResponse>>,
-    /// Incoming requests from the HTTP API shim.
-    api_rx: tokio::sync::mpsc::UnboundedReceiver<ApiRequest>,
 }
 
 impl OmniPaxosServer {
-    pub async fn new(
-        config: OmniPaxosKVConfig,
-        api_rx: tokio::sync::mpsc::UnboundedReceiver<ApiRequest>,
-    ) -> Self {
-        // Initialize OmniPaxos instance
+    pub async fn new(config: OmniPaxosKVConfig) -> Self {
         let storage: MemoryStorage<Command> = MemoryStorage::default();
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
-        // Waits for client and server network connections to be established
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
         OmniPaxosServer {
             id: config.local.server_id,
@@ -68,8 +42,6 @@ impl OmniPaxosServer {
             omnipaxos_msg_buffer,
             peers: config.get_peers(config.local.server_id),
             config,
-            pending: HashMap::new(),
-            api_rx,
         }
     }
 
@@ -83,7 +55,6 @@ impl OmniPaxosServer {
             .await;
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
-        let mut api_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         loop {
             tokio::select! {
                 _ = election_interval.tick() => {
@@ -95,11 +66,6 @@ impl OmniPaxosServer {
                 },
                 _ = self.network.client_messages.recv_many(&mut client_msg_buf, NETWORK_BATCH_SIZE) => {
                     self.handle_client_messages(&mut client_msg_buf).await;
-                },
-                count = self.api_rx.recv_many(&mut api_buf, NETWORK_BATCH_SIZE) => {
-                    if count > 0 {
-                        self.handle_api_requests(&mut api_buf);
-                    }
                 },
             }
         }
@@ -167,14 +133,6 @@ impl OmniPaxosServer {
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
             let result = self.database.handle_command(command.kv_cmd);
-            // Resolve any pending HTTP API request waiting on this command
-            if let Some(tx) = self.pending.remove(&command.id) {
-                let response = match result.clone() {
-                    Some(r) => ApiResponse::Ok(r),
-                    None => ApiResponse::Ok(KVResult::Value(None)),
-                };
-                let _ = tx.send(response);
-            }
             // Also reply to the legacy TCP client protocol
             if command.coordinator_id == self.id {
                 let response = match result {
@@ -242,36 +200,6 @@ impl OmniPaxosServer {
             .expect("Append to Omnipaxos log failed");
     }
 
-    /// Handle requests coming from the HTTP API shim.
-    /// All operations (including reads) are routed through OmniPaxos for linearizability.
-    fn handle_api_requests(&mut self, requests: &mut Vec<ApiRequest>) {
-        for req in requests.drain(..) {
-            // Check leadership – only the leader can append
-            let leader = self.omnipaxos.get_current_leader().map(|(id, _)| id);
-            if leader != Some(self.id) {
-                let _ = req.respond_to.send(ApiResponse::NotLeader(leader));
-                continue;
-            }
-            let cmd_id = req.command_id;
-            let command = Command {
-                // HTTP API requests use client_id = 0 (reserved)
-                client_id: 0,
-                coordinator_id: self.id,
-                id: cmd_id,
-                kv_cmd: req.kv_cmd,
-            };
-            match self.omnipaxos.append(command) {
-                Ok(_) => {
-                    self.pending.insert(cmd_id, req.respond_to);
-                }
-                Err(e) => {
-                    warn!("Failed to append API command {cmd_id}: {e:?}");
-                    let _ = req.respond_to.send(ApiResponse::NotLeader(leader));
-                }
-            }
-            self.send_outgoing_msgs();
-        }
-    }
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {

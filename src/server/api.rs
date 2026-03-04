@@ -6,18 +6,12 @@
 /// PUT  /kv/{key}  body: plain-text value  → write (put)
 /// POST /kv/{key}/cas  body: JSON {"from": <str|null>, "to": <str>}  → compare-and-swap
 ///
-/// HTTP status codes
-/// -----------------
-/// 200   – operation succeeded (body carries JSON result)
-/// 404   – key not found (for GET)
-/// 409   – CAS precondition failed (body carries {"current": <str|null>})
-/// 503   – this node is not the leader right now
-///         body: {"leader": <node_id|null>}  so clients can redirect
-///
-/// Jepsen interprets a TCP-reset / timeout as `:info` (indeterminate).
-/// A 503 from a follower is a definitive `:fail` – the write never happened.
+/// All requests are injected as ClientMessage::Append(client_id=0) directly into the
+/// server's client_messages channel, so any node handles them identically to a TCP client.
+/// Responses come back as ServerMessage via a shared pending map.
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use axum::{
     body::Bytes,
@@ -28,11 +22,16 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::{oneshot, Mutex};
+use tokio::sync::mpsc::Sender;
 
-use omnipaxos_kv::common::{kv::KVCommand, messages::KVResult};
+use omnipaxos_kv::common::{kv::{ClientId, CommandId, KVCommand}, messages::{ClientMessage, KVResult, ServerMessage}};
 
-use crate::server::{ApiRequest, ApiResponse};
+// ---------------------------------------------------------------------------
+// Pending map: CommandId → oneshot response sender
+// ---------------------------------------------------------------------------
+
+pub type PendingMap = Arc<Mutex<HashMap<CommandId, oneshot::Sender<ServerMessage>>>>;
 
 // ---------------------------------------------------------------------------
 // Shared state passed to every Axum handler
@@ -40,40 +39,39 @@ use crate::server::{ApiRequest, ApiResponse};
 
 #[derive(Clone)]
 pub struct ApiState {
-    pub tx: UnboundedSender<ApiRequest>,
+    /// Injects (client_id=0, ClientMessage) straight into the server's client_messages channel.
+    pub tx: Sender<(ClientId, ClientMessage)>,
     pub cmd_counter: Arc<AtomicUsize>,
+    pub pending: PendingMap,
 }
 
 impl ApiState {
-    pub fn new(tx: UnboundedSender<ApiRequest>) -> Self {
+    pub fn new(tx: Sender<(ClientId, ClientMessage)>, pending: PendingMap) -> Self {
         Self {
             tx,
             cmd_counter: Arc::new(AtomicUsize::new(1)),
+            pending,
         }
     }
 
-    fn next_cmd_id(&self) -> usize {
-        // Use a large offset so HTTP-issued IDs never clash with TCP-client IDs
-        // (TCP clients start from 1 and use small integers).
+    fn next_cmd_id(&self) -> CommandId {
+        // Large offset so HTTP-issued IDs never clash with TCP-client IDs.
         0x8000_0000 + self.cmd_counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn submit(&self, kv_cmd: KVCommand) -> Result<KVResult, Option<u64>> {
+    async fn submit(&self, kv_cmd: KVCommand) -> Result<KVResult, ()> {
         let cmd_id = self.next_cmd_id();
         let (respond_to, rx) = oneshot::channel();
-        let req = ApiRequest {
-            command_id: cmd_id,
-            kv_cmd,
-            respond_to,
-        };
-        // If the server task has gone away this is a fatal error; just propagate as not-leader.
-        if self.tx.send(req).is_err() {
-            return Err(None);
+        self.pending.lock().await.insert(cmd_id, respond_to);
+        let msg = ClientMessage::Append(cmd_id, kv_cmd);
+        if self.tx.send((0, msg)).await.is_err() {
+            self.pending.lock().await.remove(&cmd_id);
+            return Err(());
         }
         match rx.await {
-            Ok(ApiResponse::Ok(result)) => Ok(result),
-            Ok(ApiResponse::NotLeader(leader)) => Err(leader),
-            Err(_) => Err(None), // server dropped the sender (crash / shutdown)
+            Ok(ServerMessage::Read(_, result)) => Ok(result),
+            Ok(ServerMessage::Write(_)) => Ok(KVResult::Value(None)),
+            _ => Err(()),
         }
     }
 }
@@ -88,20 +86,13 @@ struct ReadBody {
 }
 
 #[derive(Serialize)]
-struct NotLeaderBody {
-    leader: Option<u64>,
-}
-
-#[derive(Serialize)]
 struct CasFailedBody {
     current: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct CasPayload {
-    /// The value we expect to be stored currently (null = key absent).
     pub from: Option<String>,
-    /// The value to store if the precondition holds.
     pub to: String,
 }
 
@@ -113,19 +104,11 @@ pub struct CasPayload {
 async fn handle_get(Path(key): Path<String>, State(state): State<ApiState>) -> Response {
     match state.submit(KVCommand::Get(key)).await {
         Ok(KVResult::Value(val)) => {
-            let status = if val.is_some() {
-                StatusCode::OK
-            } else {
-                StatusCode::NOT_FOUND
-            };
+            let status = if val.is_some() { StatusCode::OK } else { StatusCode::NOT_FOUND };
             (status, Json(ReadBody { value: val })).into_response()
         }
         Ok(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        Err(leader) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(NotLeaderBody { leader }),
-        )
-            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -141,11 +124,7 @@ async fn handle_put(
     };
     match state.submit(KVCommand::Put(key, value)).await {
         Ok(_) => StatusCode::OK.into_response(),
-        Err(leader) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(NotLeaderBody { leader }),
-        )
-            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -155,22 +134,14 @@ async fn handle_cas(
     State(state): State<ApiState>,
     Json(payload): Json<CasPayload>,
 ) -> Response {
-    match state
-        .submit(KVCommand::Cas(key, payload.from, payload.to))
-        .await
-    {
+    match state.submit(KVCommand::Cas(key, payload.from, payload.to)).await {
         Ok(KVResult::CasOk) => StatusCode::OK.into_response(),
         Ok(KVResult::CasFailed(current)) => (
             StatusCode::CONFLICT,
             Json(CasFailedBody { current }),
-        )
-            .into_response(),
+        ).into_response(),
         Ok(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        Err(leader) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(NotLeaderBody { leader }),
-        )
-            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -180,9 +151,8 @@ async fn handle_cas(
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
+        .route("/", get(|| async { "OmniPaxos KV HTTP API" }))
         .route("/kv/:key", get(handle_get).put(handle_put))
         .route("/kv/:key/cas", post(handle_cas))
         .with_state(state)
 }
-
-

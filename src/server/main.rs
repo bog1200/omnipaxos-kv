@@ -1,11 +1,15 @@
 use crate::{configs::OmniPaxosKVConfig, server::OmniPaxosServer};
 use env_logger;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 mod api;
 mod configs;
 mod database;
 mod network;
 mod server;
+
 #[tokio::main]
 pub async fn main() {
     env_logger::init();
@@ -13,9 +17,6 @@ pub async fn main() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };
-
-    // Channel connecting the HTTP API shim → OmniPaxosServer
-    let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Determine HTTP API bind address
     let api_port = server_config
@@ -29,8 +30,38 @@ pub async fn main() {
     .parse()
     .expect("Invalid API listen address");
 
+    // Build the server (establishes cluster connections)
+    let mut server = OmniPaxosServer::new(server_config).await;
+
+    // Wire up the API:
+    // 1. api_sender injects ClientMessage::Append(client_id=0) into the server's client_messages
+    // 2. api_response_tx/rx carries ServerMessage responses back for client_id=0
+    let api_sender = server.network.api_sender();
+    let (api_response_tx, mut api_response_rx) =
+        tokio::sync::mpsc::unbounded_channel::<omnipaxos_kv::common::messages::ServerMessage>();
+    server.network.set_api_response_channel(api_response_tx);
+
+    // Pending map shared between the response-dispatch task and the Axum handlers
+    let pending: api::PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let pending_dispatch = pending.clone();
+
+    // Spawn a task that receives ServerMessages for client_id=0 and resolves pending futures
+    tokio::spawn(async move {
+        while let Some(msg) = api_response_rx.recv().await {
+            use omnipaxos_kv::common::messages::ServerMessage;
+            let cmd_id = match &msg {
+                ServerMessage::Read(id, _) => *id,
+                ServerMessage::Write(id) => *id,
+                ServerMessage::StartSignal(_) => continue,
+            };
+            if let Some(tx) = pending_dispatch.lock().await.remove(&cmd_id) {
+                let _ = tx.send(msg);
+            }
+        }
+    });
+
     // Spawn the Axum HTTP server
-    let api_state = api::ApiState::new(api_tx);
+    let api_state = api::ApiState::new(api_sender, pending);
     let router = api::router(api_state);
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(api_addr)
@@ -42,6 +73,5 @@ pub async fn main() {
             .expect("HTTP API server error");
     });
 
-    let mut server = OmniPaxosServer::new(server_config, api_rx).await;
     server.run().await;
 }

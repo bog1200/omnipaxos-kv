@@ -28,6 +28,8 @@ pub struct Network {
     cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
     pub cluster_messages: Receiver<(NodeId, ClusterMessage)>,
     pub client_messages: Receiver<(ClientId, ClientMessage)>,
+    /// Channel for sending ServerMessage responses back to the HTTP API (client_id = 0).
+    api_response_tx: Option<tokio::sync::mpsc::UnboundedSender<ServerMessage>>,
 }
 
 fn get_addrs(config: OmniPaxosKVConfig) -> (SocketAddr, Vec<SocketAddr>) {
@@ -77,12 +79,27 @@ impl Network {
             cluster_message_sender,
             cluster_messages,
             client_messages,
+            api_response_tx: None,
         };
         let num_clients = config.local.num_clients;
         network
             .initialize_connections(id, num_clients, peer_addresses, listen_address)
             .await;
         network
+    }
+
+    /// Returns a sender that injects (client_id=0, ClientMessage) directly into the
+    /// client_messages channel, bypassing TCP entirely.
+    pub fn api_sender(&self) -> Sender<(ClientId, ClientMessage)> {
+        self.client_message_sender.clone()
+    }
+
+    /// Registers a channel that will receive ServerMessage responses for client_id = 0.
+    pub fn set_api_response_channel(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<ServerMessage>,
+    ) {
+        self.api_response_tx = Some(tx);
     }
 
     async fn initialize_connections(
@@ -258,6 +275,14 @@ impl Network {
     }
 
     pub fn send_to_client(&mut self, to: ClientId, msg: ServerMessage) {
+        if to == 0 {
+            if let Some(ref tx) = self.api_response_tx {
+                if let Err(e) = tx.send(msg) {
+                    warn!("Couldn't send response to HTTP API: {e}");
+                }
+            }
+            return;
+        }
         match self.client_connections.get_mut(&to) {
             Some(connection) => {
                 if let Err(err) = connection.send(msg) {
