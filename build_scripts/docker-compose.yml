@@ -20,7 +20,10 @@ services:
       <<: *common-server-variables
       OMNIPAXOS_API_PORT: 9000   # HTTP shim API port inside the container
     ports:
-      - "9001:9000"              # host:9001 → container s1:9000
+      - "9001:9000"
+      - "2201:22"
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ./server-1-config.toml:/app/server-config.toml
       - ./cluster-config.toml:/app/cluster-config.toml
@@ -33,6 +36,9 @@ services:
       OMNIPAXOS_API_PORT: 9000
     ports:
       - "9002:9000"              # host:9002 → container s2:9000
+      - "2202:22"
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ./server-2-config.toml:/app/server-config.toml
       - ./cluster-config.toml:/app/cluster-config.toml
@@ -45,30 +51,33 @@ services:
       OMNIPAXOS_API_PORT: 9000
     ports:
       - "9003:9000"              # host:9003 → container s3:9000
+      - "2203:22"
+    cap_add:
+      - NET_ADMIN
     volumes:
       - ./server-3-config.toml:/app/server-config.toml
       - ./cluster-config.toml:/app/cluster-config.toml
       - ./logs/:/app/logs/
-  c1:
-    image: omnipaxos-client
-    build:
-      context: ./..
-      dockerfile: client.dockerfile
-    container_name: c1
-    environment:
-      RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Overwrite server_address in client config TOML
-    volumes:
-      - ./client-1-config.toml:/app/client-config.toml
-      - ./logs/:/app/logs/
-  c2:
-    image: omnipaxos-client
-    container_name: c2
-    environment:
-      RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
-    volumes:
-      - ./client-2-config.toml:/app/client-config.toml
-      - ./logs/:/app/logs/
+#  c1:
+#    image: omnipaxos-client
+#    build:
+#      context: ./..
+#      dockerfile: client.dockerfile
+#    container_name: c1
+#    environment:
+#      RUST_LOG: "debug"
+#      CONFIG_FILE: "/app/client-config.toml"
+#      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Overwrite server_address in client config TOML
+#    volumes:
+#      - ./client-1-config.toml:/app/client-config.toml
+#      - ./logs/:/app/logs/
+#  c2:
+#    image: omnipaxos-client
+#    container_name: c2
+#    environment:
+#      RUST_LOG: "debug"
+#      CONFIG_FILE: "/app/client-config.toml"
+#      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
+#    volumes:
+#      - ./client-2-config.toml:/app/client-config.toml
+#      - ./logs/:/app/logs/

@@ -25,6 +25,33 @@ RUN cargo build --release --bin server
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
-COPY --from=builder /app/target/release/server /usr/local/bin
-EXPOSE 8000
-ENTRYPOINT ["/usr/local/bin/server"]
+
+# Install Jepsen's "toolbox"
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    sudo \
+    iptables \
+    iproute2 \
+    iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Setup SSH: Allow root login with password 'root'
+RUN mkdir /var/run/sshd && \
+    echo 'root:root' | chpasswd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+
+# Ensure sudo doesn't prompt for password (required by Jepsen scripts)
+RUN echo "root ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Entrypoint script to start SSH + OmniPaxos
+RUN echo '#!/bin/bash\n\
+/usr/sbin/sshd\n\
+exec /usr/local/bin/omnipaxos-server "$@"' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+
+# Copy your Rust binary
+COPY --from=builder /app/target/release/server /usr/local/bin/omnipaxos-server
+
+EXPOSE 22 8000 9000
+ENTRYPOINT ["/entrypoint.sh"]
