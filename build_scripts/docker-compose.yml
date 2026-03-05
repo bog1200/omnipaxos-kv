@@ -81,3 +81,12 @@ services:
     volumes:
       - ./client-2-config.toml:/app/client-config.toml
       - ./logs/:/app/logs/
+
+  jepsen:
+    image: omnipaxos-jepsen
+    build:
+      context: ./../../omnipaxos-jepsen
+      dockerfile: jepsen.dockerfile
+    container_name: jepsen
+    volumes:
+      - "./../../omnipaxos-jepsen/store:/app/store"
