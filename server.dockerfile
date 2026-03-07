@@ -33,21 +33,26 @@ RUN apt-get update && apt-get install -y \
     iptables \
     iproute2 \
     iputils-ping \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
-# Setup SSH: Allow root login with password 'root'
+# Setup SSH: Allow root login with password 'root', read /etc/environment
 RUN mkdir /var/run/sshd && \
     echo 'root:root' | chpasswd && \
-    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    echo 'PermitUserEnvironment yes' >> /etc/ssh/sshd_config
 
 # Ensure sudo doesn't prompt for password (required by Jepsen scripts)
 RUN echo "root ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-# Entrypoint script to start SSH + OmniPaxos
-RUN echo '#!/bin/bash\n\
-/usr/sbin/sshd\n\
-exec /usr/local/bin/omnipaxos-server "$@"' > /entrypoint.sh && \
-    chmod +x /entrypoint.sh
+# Entrypoint: export docker-compose env vars to /etc/environment so SSH
+# sessions can read them, then start sshd.
+RUN cat > /entrypoint.sh << 'EOF'
+#!/bin/bash
+printenv | grep -v "HOME\|PWD\|PATH\|SHLVL\|_=" >> /etc/environment
+exec /usr/sbin/sshd -D
+EOF
+RUN chmod +x /entrypoint.sh
 
 
 # Copy your Rust binary

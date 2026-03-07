@@ -2,6 +2,7 @@ use crate::{configs::OmniPaxosKVConfig, server::OmniPaxosServer};
 use env_logger;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
 mod api;
@@ -17,6 +18,30 @@ pub async fn main() {
         Ok(parsed_config) => parsed_config,
         Err(e) => panic!("{e}"),
     };
+
+    // --- Dump environment and config to console ---
+    // We serialize both the environment variables and the config as JSON
+    // and print them to stdout so they appear on the container console.
+    {
+        let env_map: HashMap<String, String> = std::env::vars().collect();
+        let config_json = match serde_json::to_string_pretty(&server_config) {
+            Ok(s) => s,
+            Err(e) => format!("<failed to serialize config: {}>", e),
+        };
+        let env_json = match serde_json::to_string_pretty(&env_map) {
+            Ok(s) => s,
+            Err(e) => format!("<failed to serialize env: {}>", e),
+        };
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        log::info!("timestamp_secs: {}", ts);
+        log::info!("\n=== ENVIRONMENT ===\n{}\n", env_json);
+        log::info!("\n=== CONFIG ===\n{}\n", config_json);
+    }
 
     // Determine HTTP API bind address
     let api_port = server_config
