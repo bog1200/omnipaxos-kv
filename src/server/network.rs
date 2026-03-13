@@ -8,7 +8,10 @@ use omnipaxos_kv::common::{
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -19,11 +22,16 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::configs::OmniPaxosKVConfig;
 
 pub struct Network {
+    node_id: NodeId,
     peers: Vec<NodeId>,
+    peer_addresses: Vec<SocketAddr>,
     peer_connections: Vec<Option<PeerConnection>>,
     client_connections: HashMap<ClientId, ClientConnection>,
     max_client_id: Arc<Mutex<ClientId>>,
     batch_size: usize,
+    connection_sink: Sender<NewConnection>,
+    connection_source: Receiver<NewConnection>,
+    reconnecting_peers: HashSet<NodeId>,
     client_message_sender: Sender<(ClientId, ClientMessage)>,
     cluster_message_sender: Sender<(NodeId, ClusterMessage)>,
     pub cluster_messages: Receiver<(NodeId, ClusterMessage)>,
@@ -69,12 +77,18 @@ impl Network {
         cluster_connections.resize_with(peer_addresses.len(), Default::default);
         let (cluster_message_sender, cluster_messages) = tokio::sync::mpsc::channel(batch_size);
         let (client_message_sender, client_messages) = tokio::sync::mpsc::channel(batch_size);
+        let (connection_sink, connection_source) = mpsc::channel(30);
         let mut network = Self {
+            node_id: id,
             peers: peer_addresses.iter().map(|(id, _)| *id).collect(),
+            peer_addresses: peer_addresses.iter().map(|(_, addr)| *addr).collect(),
             peer_connections: cluster_connections,
             client_connections: HashMap::new(),
             max_client_id: Arc::new(Mutex::new(0)),
             batch_size,
+            connection_sink,
+            connection_source,
+            reconnecting_peers: HashSet::new(),
             client_message_sender,
             cluster_message_sender,
             cluster_messages,
@@ -109,28 +123,42 @@ impl Network {
         peers: Vec<(NodeId, SocketAddr)>,
         listen_address: SocketAddr,
     ) {
-        let (connection_sink, mut connection_source) = mpsc::channel(30);
-        let listener_handle =
-            self.spawn_connection_listener(connection_sink.clone(), listen_address);
-        self.spawn_peer_connectors(connection_sink.clone(), id, peers);
-        while let Some(new_connection) = connection_source.recv().await {
-            match new_connection {
-                NewConnection::ToPeer(connection) => {
-                    let peer_idx = self.cluster_id_to_idx(connection.peer_id).unwrap();
-                    self.peer_connections[peer_idx] = Some(connection);
-                }
-                NewConnection::ToClient(connection) => {
-                    let _ = self
-                        .client_connections
-                        .insert(connection.client_id, connection);
-                }
-            }
+        self.spawn_connection_listener(self.connection_sink.clone(), listen_address);
+        self.spawn_peer_connectors(id, peers);
+        while let Some(new_connection) = self.connection_source.recv().await {
+            self.register_connection(new_connection);
             let all_clients_connected = self.client_connections.len() >= num_clients;
             let all_cluster_connected = self.peer_connections.iter().all(|c| c.is_some());
             if all_clients_connected && all_cluster_connected {
-                listener_handle.abort();
                 break;
             }
+        }
+    }
+
+    fn register_connection(&mut self, new_connection: NewConnection) {
+        match new_connection {
+            NewConnection::ToPeer(connection) => {
+                let peer_id = connection.peer_id;
+                let peer_idx = self.cluster_id_to_idx(peer_id).unwrap();
+                if let Some(existing_connection) = self.peer_connections[peer_idx].take() {
+                    existing_connection.close();
+                }
+                self.peer_connections[peer_idx] = Some(connection);
+                self.reconnecting_peers.remove(&peer_id);
+            }
+            NewConnection::ToClient(connection) => {
+                if let Some(existing_connection) =
+                    self.client_connections.insert(connection.client_id, connection)
+                {
+                    existing_connection.close();
+                }
+            }
+        }
+    }
+
+    pub fn poll_new_connections(&mut self) {
+        while let Ok(new_connection) = self.connection_source.try_recv() {
+            self.register_connection(new_connection);
         }
     }
 
@@ -214,61 +242,84 @@ impl Network {
         connection_sender.send(new_connection).await.unwrap();
     }
 
-    fn spawn_peer_connectors(
-        &self,
-        connection_sender: Sender<NewConnection>,
-        my_id: NodeId,
-        peers: Vec<(NodeId, SocketAddr)>,
-    ) {
+    fn spawn_peer_connectors(&mut self, my_id: NodeId, peers: Vec<(NodeId, SocketAddr)>) {
         let peers_to_connect_to = peers.into_iter().filter(|(peer_id, _)| *peer_id < my_id);
         for (peer, peer_address) in peers_to_connect_to {
-            let reconnect_delay = Duration::from_secs(1);
-            let mut reconnect_interval = tokio::time::interval(reconnect_delay);
-            let cluster_sender = self.cluster_message_sender.clone();
-            let connection_sender = connection_sender.clone();
-            let batch_size = self.batch_size;
-            tokio::spawn(async move {
-                // Establish connection
-                let peer_connection = loop {
-                    reconnect_interval.tick().await;
-                    match TcpStream::connect(peer_address).await {
-                        Ok(connection) => {
-                            info!("New connection to node {peer}");
-                            connection.set_nodelay(true).unwrap();
-                            break connection;
-                        }
-                        Err(err) => {
-                            error!("Establishing connection to node {peer} failed: {err}")
-                        }
+            self.spawn_peer_connector(my_id, peer, peer_address);
+        }
+    }
+
+    fn spawn_peer_connector(&self, my_id: NodeId, peer: NodeId, peer_address: SocketAddr) {
+        let reconnect_delay = Duration::from_secs(1);
+        let mut reconnect_interval = tokio::time::interval(reconnect_delay);
+        let cluster_sender = self.cluster_message_sender.clone();
+        let connection_sender = self.connection_sink.clone();
+        let batch_size = self.batch_size;
+        tokio::spawn(async move {
+            // Establish connection
+            let peer_connection = loop {
+                reconnect_interval.tick().await;
+                match TcpStream::connect(peer_address).await {
+                    Ok(connection) => {
+                        info!("New connection to node {peer}");
+                        connection.set_nodelay(true).unwrap();
+                        break connection;
                     }
-                };
-                // Send handshake
-                let mut registration_connection = frame_registration_connection(peer_connection);
-                let handshake = RegistrationMessage::NodeRegister(my_id);
-                if let Err(err) = registration_connection.send(handshake).await {
-                    error!("Error sending handshake to {peer}: {err}");
-                    return;
+                    Err(err) => {
+                        error!("Establishing connection to node {peer} failed: {err}")
+                    }
                 }
-                let underlying_stream = registration_connection.into_inner().into_inner();
-                // Create connection actor
-                let peer_actor =
-                    PeerConnection::new(peer, underlying_stream, batch_size, cluster_sender);
-                let new_connection = NewConnection::ToPeer(peer_actor);
-                connection_sender.send(new_connection).await.unwrap();
-            });
+            };
+            // Send handshake
+            let mut registration_connection = frame_registration_connection(peer_connection);
+            let handshake = RegistrationMessage::NodeRegister(my_id);
+            if let Err(err) = registration_connection.send(handshake).await {
+                error!("Error sending handshake to {peer}: {err}");
+                return;
+            }
+            let underlying_stream = registration_connection.into_inner().into_inner();
+            // Create connection actor
+            let peer_actor = PeerConnection::new(peer, underlying_stream, batch_size, cluster_sender);
+            let new_connection = NewConnection::ToPeer(peer_actor);
+            if let Err(err) = connection_sender.send(new_connection).await {
+                warn!("Failed to register connection to node {peer}: {err}");
+            }
+        });
+    }
+
+    fn maybe_reconnect_peer(&mut self, peer: NodeId) {
+        if peer >= self.node_id {
+            return;
+        }
+        if self.reconnecting_peers.contains(&peer) {
+            return;
+        }
+        if let Some(idx) = self.cluster_id_to_idx(peer) {
+            if self.peer_connections[idx].is_none() {
+                self.reconnecting_peers.insert(peer);
+                let peer_address = self.peer_addresses[idx];
+                self.spawn_peer_connector(self.node_id, peer, peer_address);
+            }
         }
     }
 
     pub fn send_to_cluster(&mut self, to: NodeId, msg: ClusterMessage) {
+        self.poll_new_connections();
         match self.cluster_id_to_idx(to) {
             Some(idx) => match &mut self.peer_connections[idx] {
                 Some(ref mut connection) => {
                     if let Err(err) = connection.send(msg) {
                         warn!("Couldn't send msg to peer {to}: {err}");
-                        self.peer_connections[idx] = None;
+                        if let Some(connection) = self.peer_connections[idx].take() {
+                            connection.close();
+                        }
+                        self.maybe_reconnect_peer(to);
                     }
                 }
-                None => warn!("Not connected to node {to}"),
+                None => {
+                    warn!("Not connected to node {to}");
+                    self.maybe_reconnect_peer(to);
+                }
             },
             None => error!("Sending to unexpected node {to}"),
         }
@@ -308,6 +359,7 @@ impl Network {
         for _ in 0..self.peers.len() {
             self.peer_connections.push(None);
         }
+        self.reconnecting_peers.clear();
     }
 
     #[inline]

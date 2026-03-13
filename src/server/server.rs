@@ -56,6 +56,7 @@ impl OmniPaxosServer {
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
         loop {
+            self.network.poll_new_connections();
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
@@ -81,6 +82,7 @@ impl OmniPaxosServer {
     ) {
         let mut leader_takeover_interval = tokio::time::interval(LEADER_WAIT);
         loop {
+            self.network.poll_new_connections();
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
                     if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
