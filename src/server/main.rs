@@ -1,7 +1,7 @@
 use crate::{configs::OmniPaxosKVConfig, server::OmniPaxosServer};
 use env_logger;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, Arc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -48,15 +48,16 @@ pub async fn main() {
         .local
         .api_port
         .unwrap_or(server_config.local.listen_port + 1000);
-    let api_addr: std::net::SocketAddr = format!(
-        "{}:{}",
-        server_config.local.listen_address, api_port
-    )
-    .parse()
-    .expect("Invalid API listen address");
+    let api_addr: std::net::SocketAddr =
+        format!("{}:{}", server_config.local.listen_address, api_port)
+            .parse()
+            .expect("Invalid API listen address");
+
+    // Shared leader state exposed through the HTTP API.
+    let leader_state = Arc::new(AtomicU64::new(0));
 
     // Build the server (establishes cluster connections)
-    let mut server = OmniPaxosServer::new(server_config).await;
+    let mut server = OmniPaxosServer::new(server_config, leader_state.clone()).await;
 
     // Wire up the API:
     // 1. api_sender injects ClientMessage::Append(client_id=0) into the server's client_messages
@@ -86,7 +87,7 @@ pub async fn main() {
     });
 
     // Spawn the Axum HTTP server
-    let api_state = api::ApiState::new(api_sender, pending);
+    let api_state = api::ApiState::new(api_sender, pending, leader_state);
     let router = api::router(api_state);
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(api_addr)
