@@ -10,6 +10,7 @@ mod configs;
 mod database;
 mod network;
 mod server;
+mod storage;
 
 #[tokio::main]
 pub async fn main() {

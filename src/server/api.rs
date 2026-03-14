@@ -116,6 +116,15 @@ async fn handle_put(
     }
 }
 
+async fn handle_ready(State(state): State<ApiState>) -> Response {
+    // Submit a real read through consensus. If log isn't synced, it will
+    // time out (since handle_client_messages drops it). If synced, returns.
+    match state.submit(KVCommand::Get("__ready__".to_string())).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -124,5 +133,6 @@ pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(|| async { "OmniPaxos KV HTTP API" }))
         .route("/kv/:key", get(handle_get).put(handle_put))
+        .route("/ready", get(handle_ready))
         .with_state(state)
 }

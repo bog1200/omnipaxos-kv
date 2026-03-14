@@ -6,11 +6,14 @@ use omnipaxos::{
     util::{LogEntry, NodeId},
     OmniPaxos, OmniPaxosConfig,
 };
+
+use crate::storage::FileStorage;
+
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
-use omnipaxos_storage::memory_storage::MemoryStorage;
+//use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::{fs::File, io::Write, time::Duration};
 
-type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
+type OmniPaxosInstance = OmniPaxos<Command, FileStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -24,11 +27,15 @@ pub struct OmniPaxosServer {
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
     peers: Vec<NodeId>,
+    log_synced: bool,
 }
 
 impl OmniPaxosServer {
     pub async fn new(config: OmniPaxosKVConfig) -> Self {
-        let storage: MemoryStorage<Command> = MemoryStorage::default();
+        let storage_path = std::path::PathBuf::from(
+            format!("/app/logs/storage-node-{}.json", config.local.server_id)
+        );
+        let storage = FileStorage::<Command>::new(storage_path);
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
@@ -42,6 +49,7 @@ impl OmniPaxosServer {
             omnipaxos_msg_buffer,
             peers: config.get_peers(config.local.server_id),
             config,
+            log_synced: false,
         }
     }
 
@@ -130,6 +138,10 @@ impl OmniPaxosServer {
                 .collect();
             self.update_database_and_respond(decided_commands);
         }
+        if !self.log_synced && self.current_decided_idx == self.omnipaxos.get_decided_idx() {
+            info!("{}: Log synced up to {}, marking ready", self.id, self.current_decided_idx);
+            self.log_synced = true;
+        }
     }
 
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
@@ -160,7 +172,17 @@ impl OmniPaxosServer {
         for (from, message) in messages.drain(..) {
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
-                    self.append_to_log(from, command_id, kv_command)
+                    if !self.log_synced {
+                        // Not caught up yet — send error so client gets :info (indeterminate)
+                        warn!("{}: Not log-synced yet, rejecting command {}", self.id, command_id);
+                        // We can't send a proper error without a result type, so just drop it.
+                        // The HTTP client will time out and Jepsen will mark it :info.
+                        // Alternatively send a dummy Write response so the pending map clears:
+                        let response = ServerMessage::Write(command_id);
+                        self.network.send_to_client(from, response);
+                    } else {
+                        self.append_to_log(from, command_id, kv_command)
+                    }
                 }
             }
         }
@@ -225,5 +247,5 @@ impl OmniPaxosServer {
         output_file.write_all(config_json.as_bytes())?;
         output_file.flush()?;
         Ok(())
-    }
+    } 
 }

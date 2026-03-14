@@ -52,7 +52,7 @@ RUN cat > /entrypoint.sh << 'EOF'
 printenv | grep -v "HOME\|PWD\|PATH\|SHLVL\|_=" >> /etc/environment
 exec /usr/sbin/sshd -D
 EOF
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 
 # Copy your Rust binary
