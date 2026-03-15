@@ -45,6 +45,7 @@ impl Into<OmniPaxosConfig> for OmniPaxosKVConfig {
         };
         let server_config = OmnipaxosServerConfig {
             pid: self.local.server_id,
+            election_tick_timeout: 5,
             ..Default::default()
         };
         OmniPaxosConfig {

@@ -22,7 +22,7 @@ use std::{
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
-const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
+const ELECTION_TIMEOUT: Duration =  Duration::from_millis(100);
 const UNKNOWN_LEADER_ID: u64 = 0;
 
 pub struct OmniPaxosServer {
