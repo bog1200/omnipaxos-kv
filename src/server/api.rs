@@ -2,10 +2,8 @@
 ///
 /// Endpoints
 /// ---------
-/// GET    /kv/{key}                          → read
-/// PUT    /kv/{key}  body: plain-text value  → write (put)
-/// POST   /kv/{key}  body: {"from":<str|null>,"to":<str>} → compare-and-swap
-/// DELETE /kv/{key}                          → delete (remove key)
+/// GET  /kv/{key}                          → read
+/// PUT  /kv/{key}  body: plain-text value  → write (put)
 ///
 /// All requests are injected as ClientMessage::Append(client_id=0) directly into the
 /// server's client_messages channel, so any node handles them identically to a TCP client.
@@ -22,7 +20,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::{oneshot, Mutex};
 use tokio::sync::mpsc::Sender;
 
@@ -86,12 +84,6 @@ struct ReadBody {
     value: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct CasBody {
-    from: Option<String>,
-    to: String,
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -124,34 +116,6 @@ async fn handle_put(
     }
 }
 
-/// POST /kv/:key   body = {"from": <string|null>, "to": <string>}
-/// 200  = CAS succeeded
-/// 409  = CAS failed (current value did not match `from`)
-/// 500  = consensus error / indeterminate
-async fn handle_cas(
-    Path(key): Path<String>,
-    State(state): State<ApiState>,
-    Json(body): Json<CasBody>,
-) -> Response {
-    match state.submit(KVCommand::Cas(key, body.from, body.to)).await {
-        Ok(KVResult::CasOk) => StatusCode::OK.into_response(),
-        Ok(KVResult::CasFailed(cur)) => {
-            (StatusCode::CONFLICT, Json(ReadBody { value: cur })).into_response()
-        }
-        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
-/// DELETE /kv/:key
-/// 200 = key deleted (or did not exist)
-/// 500 = consensus error / indeterminate
-async fn handle_delete(Path(key): Path<String>, State(state): State<ApiState>) -> Response {
-    match state.submit(KVCommand::Delete(key)).await {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
 async fn handle_ready(State(state): State<ApiState>) -> Response {
     // Submit a real read through consensus. If log isn't synced, it will
     // time out (since handle_client_messages drops it). If synced, returns.
@@ -168,7 +132,7 @@ async fn handle_ready(State(state): State<ApiState>) -> Response {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(|| async { "OmniPaxos KV HTTP API" }))
-        .route("/kv/:key", get(handle_get).put(handle_put).post(handle_cas).delete(handle_delete))
+        .route("/kv/:key", get(handle_get).put(handle_put))
         .route("/ready", get(handle_ready))
         .with_state(state)
 }
