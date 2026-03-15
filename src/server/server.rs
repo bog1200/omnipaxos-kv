@@ -30,6 +30,7 @@ pub struct OmniPaxosServer {
     database: Database,
     pub network: Network,
     omnipaxos: OmniPaxosInstance,
+    observed_leader: Option<(NodeId, bool)>,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
@@ -49,6 +50,7 @@ impl OmniPaxosServer {
             database: Database::new(),
             network,
             omnipaxos,
+            observed_leader: None,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
             peers: config.get_peers(config.local.server_id),
@@ -74,6 +76,7 @@ impl OmniPaxosServer {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
                     self.update_current_leader();
+                    self.log_leader_state_if_changed();
                     self.send_outgoing_msgs();
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
@@ -100,9 +103,11 @@ impl OmniPaxosServer {
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
                     self.update_current_leader();
+                    self.log_leader_state_if_changed();
                     if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
                         if curr_leader == self.id && is_accept_phase {
                             self.update_current_leader();
+                            self.log_leader_state_if_changed();
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
@@ -172,6 +177,24 @@ impl OmniPaxosServer {
         }
     }
 
+    fn log_leader_state_if_changed(&mut self) {
+        let previous_leader = self.observed_leader;
+        let current_leader = self.omnipaxos.get_current_leader();
+        if current_leader != previous_leader {
+            if let Some((leader_id, is_accept_phase)) = current_leader {
+                let previously_same_leader_in_accept = previous_leader
+                    .map(|(prev_leader_id, prev_accept_phase)| {
+                        prev_leader_id == leader_id && prev_accept_phase
+                    })
+                    .unwrap_or(false);
+                if is_accept_phase && !previously_same_leader_in_accept {
+                    info!("{}: New leader elected {leader_id}", self.id);
+                }
+            }
+            self.observed_leader = current_leader;
+        }
+    }
+
     fn send_outgoing_msgs(&mut self) {
         self.omnipaxos
             .take_outgoing_messages(&mut self.omnipaxos_msg_buffer);
@@ -204,6 +227,7 @@ impl OmniPaxosServer {
                 ClusterMessage::OmniPaxosMessage(m) => {
                     self.omnipaxos.handle_incoming(m);
                     self.update_current_leader();
+                    self.log_leader_state_if_changed();
                     self.handle_decided_entries();
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
@@ -213,6 +237,7 @@ impl OmniPaxosServer {
                 }
             }
         }
+        self.log_leader_state_if_changed();
         self.send_outgoing_msgs();
         received_start_signal
     }
