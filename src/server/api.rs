@@ -154,16 +154,6 @@ async fn handle_put(
     }
 }
 
-/// DELETE /kv/:key
-/// 200 = key deleted (or did not exist)
-/// 500 = consensus error / indeterminate
-async fn handle_delete(Path(key): Path<String>, State(state): State<ApiState>) -> Response {
-    match state.submit(KVCommand::Delete(key)).await {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
 async fn handle_ready(State(state): State<ApiState>) -> Response {
     // Submit a real read through consensus. If log isn't synced, it will
     // time out (since handle_client_messages drops it). If synced, returns.
@@ -180,7 +170,7 @@ async fn handle_ready(State(state): State<ApiState>) -> Response {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(|| async { "OmniPaxos KV HTTP API" }))
-        .route("/kv/:key", get(handle_get).put(handle_put).delete(handle_delete))
+        .route("/kv/:key", get(handle_get).put(handle_put))
         .route("/ready", get(handle_ready))
         .with_state(state)
 }
