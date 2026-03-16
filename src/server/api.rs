@@ -2,15 +2,15 @@
 ///
 /// Endpoints
 /// ---------
-/// GET  /kv/{key}                          → read
-/// PUT  /kv/{key}  body: plain-text value  → write (put)
+/// GET  /kv/{key}                          → {"value": <string|null>, "leader_id": <node-id|null>}
+/// PUT  /kv/{key}  body: plain-text value  → {"leader_id": <node-id|null>}
 ///
 /// All requests are injected as ClientMessage::Append(client_id=0) directly into the
 /// server's client_messages channel, so any node handles them identically to a TCP client.
 /// Responses come back as ServerMessage via a shared pending map.
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
@@ -21,16 +21,21 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
-use tokio::sync::{oneshot, Mutex};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::{oneshot, Mutex};
 
-use omnipaxos_kv::common::{kv::{ClientId, CommandId, KVCommand}, messages::{ClientMessage, KVResult, ServerMessage}};
+use omnipaxos_kv::common::{
+    kv::{ClientId, CommandId, KVCommand, NodeId},
+    messages::{ClientMessage, KVResult, ServerMessage},
+};
 
 // ---------------------------------------------------------------------------
 // Pending map: CommandId → oneshot response sender
 // ---------------------------------------------------------------------------
 
 pub type PendingMap = Arc<Mutex<HashMap<CommandId, oneshot::Sender<ServerMessage>>>>;
+pub type LeaderState = Arc<AtomicU64>;
+const UNKNOWN_LEADER_ID: u64 = 0;
 
 // ---------------------------------------------------------------------------
 // Shared state passed to every Axum handler
@@ -42,14 +47,27 @@ pub struct ApiState {
     pub tx: Sender<(ClientId, ClientMessage)>,
     pub cmd_counter: Arc<AtomicUsize>,
     pub pending: PendingMap,
+    pub leader: LeaderState,
 }
 
 impl ApiState {
-    pub fn new(tx: Sender<(ClientId, ClientMessage)>, pending: PendingMap) -> Self {
+    pub fn new(
+        tx: Sender<(ClientId, ClientMessage)>,
+        pending: PendingMap,
+        leader: LeaderState,
+    ) -> Self {
         Self {
             tx,
             cmd_counter: Arc::new(AtomicUsize::new(1)),
             pending,
+            leader,
+        }
+    }
+
+    fn current_leader_id(&self) -> Option<NodeId> {
+        match self.leader.load(Ordering::Relaxed) {
+            UNKNOWN_LEADER_ID => None,
+            leader_id => Some(leader_id as NodeId),
         }
     }
 
@@ -82,6 +100,12 @@ impl ApiState {
 #[derive(Serialize)]
 struct ReadBody {
     value: Option<String>,
+    leader_id: Option<NodeId>,
+}
+
+#[derive(Serialize)]
+struct WriteBody {
+    leader_id: Option<NodeId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,8 +116,19 @@ struct ReadBody {
 async fn handle_get(Path(key): Path<String>, State(state): State<ApiState>) -> Response {
     match state.submit(KVCommand::Get(key)).await {
         Ok(KVResult::Value(val)) => {
-            let status = if val.is_some() { StatusCode::OK } else { StatusCode::NOT_FOUND };
-            (status, Json(ReadBody { value: val })).into_response()
+            let status = if val.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            (
+                status,
+                Json(ReadBody {
+                    value: val,
+                    leader_id: state.current_leader_id(),
+                }),
+            )
+                .into_response()
         }
         Ok(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -111,7 +146,10 @@ async fn handle_put(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     match state.submit(KVCommand::Put(key, value)).await {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => Json(WriteBody {
+            leader_id: state.current_leader_id(),
+        })
+        .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

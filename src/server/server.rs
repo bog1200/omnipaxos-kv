@@ -11,27 +11,39 @@ use crate::storage::FileStorage;
 
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 //use omnipaxos_storage::memory_storage::MemoryStorage;
-use std::{fs::File, io::Write, time::Duration};
+use std::{
+    fs::{self, File},
+    io::Write,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 type OmniPaxosInstance = OmniPaxos<Command, FileStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
 const LEADER_WAIT: Duration = Duration::from_secs(1);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
+const UNKNOWN_LEADER_ID: u64 = 0;
 
 pub struct OmniPaxosServer {
     id: NodeId,
     database: Database,
     pub network: Network,
     omnipaxos: OmniPaxosInstance,
+    observed_leader: Option<(NodeId, bool)>,
     current_decided_idx: usize,
     omnipaxos_msg_buffer: Vec<Message<Command>>,
     config: OmniPaxosKVConfig,
     peers: Vec<NodeId>,
     log_synced: bool,
+    current_leader: Arc<AtomicU64>,
 }
 
 impl OmniPaxosServer {
-    pub async fn new(config: OmniPaxosKVConfig) -> Self {
+    pub async fn new(config: OmniPaxosKVConfig, current_leader: Arc<AtomicU64>) -> Self {
         let storage_path = std::path::PathBuf::from(
             format!("/app/logs/storage-node-{}.json", config.local.server_id)
         );
@@ -45,17 +57,20 @@ impl OmniPaxosServer {
             database: Database::new(),
             network,
             omnipaxos,
+            observed_leader: None,
             current_decided_idx: 0,
             omnipaxos_msg_buffer,
             peers: config.get_peers(config.local.server_id),
             config,
             log_synced: false,
+            current_leader,
         }
     }
 
     pub async fn run(&mut self) {
         // Save config to output file
         self.save_output().expect("Failed to write to file");
+        self.update_current_leader();
         let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         // We don't use Omnipaxos leader election at first and instead force a specific initial leader
@@ -68,6 +83,8 @@ impl OmniPaxosServer {
             tokio::select! {
                 _ = election_interval.tick() => {
                     self.omnipaxos.tick();
+                    self.update_current_leader();
+                    self.log_leader_state_if_changed();
                     self.send_outgoing_msgs();
                 },
                 _ = self.network.cluster_messages.recv_many(&mut cluster_msg_buf, NETWORK_BATCH_SIZE) => {
@@ -93,8 +110,12 @@ impl OmniPaxosServer {
             self.network.poll_new_connections();
             tokio::select! {
                 _ = leader_takeover_interval.tick(), if self.config.cluster.initial_leader == self.id => {
+                    self.update_current_leader();
+                    self.log_leader_state_if_changed();
                     if let Some((curr_leader, is_accept_phase)) = self.omnipaxos.get_current_leader(){
                         if curr_leader == self.id && is_accept_phase {
+                            self.update_current_leader();
+                            self.log_leader_state_if_changed();
                             info!("{}: Leader fully initialized", self.id);
                             let experiment_sync_start = (Utc::now() + Duration::from_secs(2)).timestamp_millis();
                             self.send_cluster_start_signals(experiment_sync_start);
@@ -104,6 +125,7 @@ impl OmniPaxosServer {
                     }
                     info!("{}: Attempting to take leadership", self.id);
                     self.omnipaxos.try_become_leader();
+                    self.update_current_leader();
                     self.send_outgoing_msgs();
                 },
                 _ = self.network.cluster_messages.recv_many(cluster_msg_buffer, NETWORK_BATCH_SIZE) => {
@@ -144,6 +166,15 @@ impl OmniPaxosServer {
         }
     }
 
+    fn update_current_leader(&self) {
+        let leader_id = self
+            .omnipaxos
+            .get_current_leader()
+            .map(|(leader_id, _)| leader_id as u64)
+            .unwrap_or(UNKNOWN_LEADER_ID);
+        self.current_leader.store(leader_id, Ordering::Relaxed);
+    }
+
     fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
             let result = self.database.handle_command(command.kv_cmd);
@@ -155,6 +186,24 @@ impl OmniPaxosServer {
                 };
                 self.network.send_to_client(command.client_id, response);
             }
+        }
+    }
+
+    fn log_leader_state_if_changed(&mut self) {
+        let previous_leader = self.observed_leader;
+        let current_leader = self.omnipaxos.get_current_leader();
+        if current_leader != previous_leader {
+            if let Some((leader_id, is_accept_phase)) = current_leader {
+                let previously_same_leader_in_accept = previous_leader
+                    .map(|(prev_leader_id, prev_accept_phase)| {
+                        prev_leader_id == leader_id && prev_accept_phase
+                    })
+                    .unwrap_or(false);
+                if is_accept_phase && !previously_same_leader_in_accept {
+                    info!("{}: New leader elected {leader_id}", self.id);
+                }
+            }
+            self.observed_leader = current_leader;
         }
     }
 
@@ -199,6 +248,8 @@ impl OmniPaxosServer {
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
                     self.omnipaxos.handle_incoming(m);
+                    self.update_current_leader();
+                    self.log_leader_state_if_changed();
                     self.handle_decided_entries();
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
@@ -208,6 +259,7 @@ impl OmniPaxosServer {
                 }
             }
         }
+        self.log_leader_state_if_changed();
         self.send_outgoing_msgs();
         received_start_signal
     }
@@ -223,7 +275,6 @@ impl OmniPaxosServer {
             .append(command)
             .expect("Append to Omnipaxos log failed");
     }
-
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {
         for peer in &self.peers {
@@ -243,7 +294,14 @@ impl OmniPaxosServer {
 
     fn save_output(&mut self) -> Result<(), std::io::Error> {
         let config_json = serde_json::to_string_pretty(&self.config)?;
-        let mut output_file = File::create(&self.config.local.output_filepath)?;
+        let output_path = Path::new(&self.config.local.output_filepath);
+        if let Some(parent) = output_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output_file = File::create(output_path)?;
         output_file.write_all(config_json.as_bytes())?;
         output_file.flush()?;
         Ok(())
