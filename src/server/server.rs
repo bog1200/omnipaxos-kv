@@ -73,9 +73,14 @@ impl OmniPaxosServer {
         self.update_current_leader();
         let mut client_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
         let mut cluster_msg_buf = Vec::with_capacity(NETWORK_BATCH_SIZE);
-        // We don't use Omnipaxos leader election at first and instead force a specific initial leader
-        self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf)
-            .await;
+        // On a fresh start (no persisted log) force the configured initial leader.
+        // On a restart (FileStorage has existing decided entries) skip this and let
+        // OmniPaxos recover through normal heartbeat-based election so the restarting
+        // node does not aggressively steal leadership from the current leader.
+        if self.omnipaxos.get_decided_idx() == 0 {
+            self.establish_initial_leader(&mut cluster_msg_buf, &mut client_msg_buf)
+                .await;
+        }
         // Main event loop with leader election
         let mut election_interval = tokio::time::interval(ELECTION_TIMEOUT);
         loop {
